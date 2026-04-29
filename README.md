@@ -37,7 +37,7 @@ cp .env.example .env
 make install
 
 # Run data preprocessing
-make preprocess
+make pipeline
 
 # Train models
 make train

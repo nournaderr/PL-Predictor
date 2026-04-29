@@ -1,0 +1,192 @@
+======================================================================
+  PREMIER LEAGUE DATASET VALIDATION REPORT
+  CMPS344 Applied Data Science – Phase 2
+======================================================================
+[INFO] Loading single file: data/processed/dataset.csv
+[INFO] Date parsed successfully with mixed format parsing.
+
+======================================================================
+  1. SHAPE & BASIC COUNTS
+======================================================================
+  Total rows    : 3,800
+  Total columns : 20
+
+  Row requirement (≥3,000)    : ✓ PASS
+  Column requirement (≥7)     : ✓ PASS
+
+======================================================================
+  2. DATA TYPES
+======================================================================
+      Column          Dtype
+        Date datetime64[us]
+    HomeTeam            str
+    AwayTeam            str
+        FTHG          int64
+        FTAG          int64
+         FTR            str
+     Referee            str
+          HS          int64
+          AS          int64
+         HST          int64
+         AST          int64
+          HF          int64
+          AF          int64
+          HC          int64
+          AC          int64
+          HY          int64
+          AY          int64
+          HR          int64
+          AR          int64
+_source_file            str
+
+======================================================================
+  3. MISSING VALUES
+======================================================================
+  ✓ No missing values detected.
+
+======================================================================
+  4. DUPLICATE ROWS
+======================================================================
+  ✓ No duplicate rows found.
+
+======================================================================
+  5. TARGET VARIABLE: FTR (Full Time Result)
+======================================================================
+
+── Value counts ────────────────────────────────────────────────
+     Count  Percentage
+FTR                   
+H     1691       44.50
+A     1223       32.18
+D      886       23.32
+
+  ✓ All FTR values are valid (H / D / A).
+
+── Class imbalance assessment ──────────────────────────────────
+  Majority class : H (44.5%)
+  Minority class : D (23.3%)
+  Imbalance ratio: 1.91:1
+  ✓ Classes are reasonably balanced.
+
+======================================================================
+  6. CATEGORICAL CONSISTENCY
+======================================================================
+  FTR unique values : ['A', 'D', 'H']
+
+  Unique teams across all seasons (34):
+    Arsenal                      Aston Villa                  Bournemouth                  Brentford                    Brighton                 
+    Burnley                      Cardiff                      Chelsea                      Crystal Palace               Everton                  
+    Fulham                       Huddersfield                 Hull                         Ipswich                      Leeds                    
+    Leicester                    Liverpool                    Luton                        Man City                     Man United               
+    Middlesbrough                Newcastle                    Norwich                      Nott'm Forest                Sheffield United         
+    Southampton                  Stoke                        Sunderland                   Swansea                      Tottenham                
+    Watford                      West Brom                    West Ham                     Wolves                   
+
+======================================================================
+  7. DATE & SEASON COVERAGE
+======================================================================
+  Earliest match : 2015-08-08
+  Latest match   : 2025-05-25
+
+  Matches per season:
+season_label  Matches
+     2015/16      380
+     2016/17      380
+     2017/18      380
+     2018/19      380
+     2019/20      380
+     2020/21      380
+     2021/22      380
+     2022/23      380
+     2023/24      380
+     2024/25      380
+
+  ✓ Every season has exactly 380 matches.
+
+======================================================================
+  8. NUMERIC RANGE SANITY CHECKS
+======================================================================
+  FTHG   (Full-time home goals          ): min=   0  max=   9  ✓
+  FTAG   (Full-time away goals          ): min=   0  max=   9  ✓
+  HS     (Home shots                    ): min=   0  max=  37  ✓
+  AS     (Away shots                    ): min=   0  max=  37  ✓
+  HST    (Home shots on target          ): min=   0  max=  17  ✓
+  AST    (Away shots on target          ): min=   0  max=  15  ✓
+  HF     (Home fouls                    ): min=   0  max=  24  ✓
+  AF     (Away fouls                    ): min=   1  max=  26  ✓
+  HC     (Home corners                  ): min=   0  max=  19  ✓
+  AC     (Away corners                  ): min=   0  max=  19  ✓
+  HY     (Home yellow cards             ): min=   0  max=   7  ✓
+  AY     (Away yellow cards             ): min=   0  max=   9  ✓
+  HR     (Home red cards                ): min=   0  max=   2  ✓
+  AR     (Away red cards                ): min=   0  max=   2  ✓
+
+  ✓ All numeric columns within expected ranges.
+
+── Logical consistency: HST ≤ HS and AST ≤ AS ──────────────────
+  Rows where HST > HS : 0
+  Rows where AST > AS : 1
+  Rows where AST > AS:
+      Date  HomeTeam AwayTeam  AS  AST
+2021-08-15 Newcastle West Ham   8    9
+
+======================================================================
+  9. DESCRIPTIVE STATISTICS (numeric columns)
+======================================================================
+          FTHG     FTAG       HS       AS      HST      AST       HF       AF       HC       AC       HY       AY       HR       AR
+count  3800.00  3800.00  3800.00  3800.00  3800.00  3800.00  3800.00  3800.00  3800.00  3800.00  3800.00  3800.00  3800.00  3800.00
+mean      1.55     1.28    13.92    11.50     4.78     4.02    10.54    10.92     5.72     4.72     1.63     1.81     0.06     0.06
+std       1.32     1.21     5.74     5.05     2.65     2.37     3.45     3.57     3.11     2.78     1.27     1.31     0.24     0.25
+min       0.00     0.00     0.00     0.00     0.00     0.00     0.00     1.00     0.00     0.00     0.00     0.00     0.00     0.00
+25%       1.00     0.00    10.00     8.00     3.00     2.00     8.00     8.00     3.00     3.00     1.00     1.00     0.00     0.00
+50%       1.00     1.00    13.00    11.00     5.00     4.00    10.00    11.00     5.00     4.00     1.00     2.00     0.00     0.00
+75%       2.00     2.00    17.00    15.00     6.00     5.00    13.00    13.00     8.00     6.00     2.00     3.00     0.00     0.00
+max       9.00     9.00    37.00    37.00    17.00    15.00    24.00    26.00    19.00    19.00     7.00     9.00     2.00     2.00
+
+======================================================================
+  10. REFEREE OVERVIEW
+======================================================================
+  Unique referees : 49
+
+  Top 10 referees by matches officiated:
+Referee
+A Taylor      295
+M Oliver      284
+C Pawson      236
+M Atkinson    197
+M Dean        195
+A Marriner    188
+J Moss        185
+P Tierney     182
+S Attwell     174
+C Kavanagh    163
+
+======================================================================
+  11. COLUMN COMPLETENESS SUMMARY
+======================================================================
+  Column        Present
+  ----------------------
+  Date                ✓
+  HomeTeam            ✓
+  AwayTeam            ✓
+  FTHG                ✓
+  FTAG                ✓
+  FTR                 ✓
+  Referee             ✓
+  HS                  ✓
+  AS                  ✓
+  HST                 ✓
+  AST                 ✓
+  HF                  ✓
+  AF                  ✓
+  HC                  ✓
+  AC                  ✓
+  HY                  ✓
+  AY                  ✓
+  HR                  ✓
+  AR                  ✓
+
+======================================================================
+  VALIDATION COMPLETE
+======================================================================
+  Report saved to data/processed/validation_report.txt

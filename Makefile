@@ -1,19 +1,49 @@
-.PHONY: install preprocess train test lint clean
+.PHONY: install construct validate clean-data enrich eda pipeline train test lint clean
 
 install:
 	poetry install
 
-preprocess:
-	poetry run python src/data/preprocess.py
+# --- Data Pipeline ---
 
-train:
-	poetry run python src/models/train.py
+construct:
+	poetry run python src/data/construct.py \
+		--input data/raw \
+		--output data/processed/dataset.csv
 
-test:
-	poetry run pytest tests/ --cov=src --cov-report=term-missing
+validate:
+	poetry run python src/data/validate.py \
+		--input data/processed/dataset.csv \
+		--output data/processed/validation_report.txt
 
-lint:
-	poetry run ruff check src/
+clean-data:
+	poetry run python src/data/clean.py \
+		--input data/processed/dataset.csv \
+		--output data/processed/cleaned_dataset.csv
+
+enrich:
+	poetry run python src/features/enrich.py \
+		--input data/processed/cleaned_dataset.csv \
+		--output data/processed/enriched_dataset.csv
+
+eda:
+	poetry run python src/visualization/eda.py \
+		--input data/processed/enriched_dataset.csv \
+		--output data/processed/vis.pdf
+
+pipeline: construct validate clean-data enrich eda
+
+# --- ML ---
+
+# train:
+# 	poetry run python src/models/train.py
+
+# # --- Dev ---
+
+# test:
+# 	poetry run pytest tests/ --cov=src --cov-report=term-missing
+
+# lint:
+# 	poetry run ruff check src/
 
 clean:
 	find . -type f -name "*.pyc" -delete
