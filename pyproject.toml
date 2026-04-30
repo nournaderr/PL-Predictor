@@ -12,9 +12,12 @@ dependencies = [
     "pandas (>=3.0.2,<4.0.0)",
     "numpy (>=2.4.4,<3.0.0)",
     "matplotlib (>=3.10.9,<4.0.0)",
-    "seaborn (>=0.13.2,<0.14.0)"
+    "seaborn (>=0.13.2,<0.14.0)",
+    "imbalanced-learn (>=0.14.1,<0.15.0)"
 ]
 
+[tool.poetry]
+package-mode = false
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]

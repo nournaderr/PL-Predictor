@@ -1,0 +1,484 @@
+"""
+preprocess.py — Preprocessing pipeline for PL-Predictor.
+
+Sits between enrich.py (feature engineering) and the modelling step.
+Performs time-aware splitting, target/categorical encoding, standard scaling,
+Pearson-based feature selection, and optional SMOTE oversampling.
+
+Usage:
+    python preprocess.py --input data/processed/dataset.csv \\
+                         --output-dir data/processed/
+    python preprocess.py --input data/processed/dataset.csv \\
+                         --output-dir data/processed/ --smote
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+
+
+NUMERICAL_FEATURES: list[str] = [
+    "HPPG", "HPPGH", "HPPG_FORM", "HPPGH_FORM",
+    "APPG", "APPGA", "APPG_FORM", "APPGA_FORM",
+    "HGS", "HGSH", "HGS_FORM", "HGSH_FORM",
+    "AGS", "AGSA", "AGS_FORM", "AGSA_FORM",
+    "HGC", "HGCH", "HGC_FORM", "HGCH_FORM",
+    "AGC", "AGCA", "AGC_FORM", "AGCA_FORM",
+    "HCS", "HCSH", "HCS_FORM", "HCSH_FORM",
+    "ACS", "ACSA", "ACS_FORM", "ACSA_FORM",
+    "HPOS", "APOS", "HPDU", "HPDD", "APDU", "APDD",
+    "HS_FORM", "AS_FORM", "HST_FORM", "AST_FORM",
+    "HF_FORM", "AF_FORM", "HC_FORM", "AC_FORM",
+    "HY_FORM", "AY_FORM", "HR_FORM", "AR_FORM",
+]
+
+CATEGORICAL_FEATURES: list[str] = ["HomeTeam", "AwayTeam", "Referee"]
+TARGET_COLUMN: str = "FTR"
+DATE_COLUMN: str = "Date"
+TARGET_MAPPING: dict[str, int] = {"H": 2, "D": 1, "A": 0}
+
+REQUIRED_COLUMNS: list[str] = (
+    NUMERICAL_FEATURES + CATEGORICAL_FEATURES + [TARGET_COLUMN, DATE_COLUMN]
+)
+
+# Row boundaries for the time-aware split (upper bounds are exclusive)
+_TRAIN_END: int = 3040   # rows 0–3039   → seasons 2015–2022
+_VAL_END: int = 3420     # rows 3040–3419 → season 2023
+
+# ---------------------------------------------------------------------------
+# Pipeline steps
+# ---------------------------------------------------------------------------
+
+
+def validate_input(df: pd.DataFrame) -> None:
+    """Raise ValueError listing every missing required column before processing begins."""
+    missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"Input dataset is missing {len(missing)} required column(s):\n"
+            + "\n".join(f"  - {c}" for c in missing)
+        )
+
+
+def split_data(
+    df: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Return (train, val, test) using a fixed time-aware row split with no shuffling.
+
+    Train : rows    0–3039  → seasons 2015–2022 (8 seasons, 3 040 rows)
+    Val   : rows 3040–3419  → season  2023      (1 season,    380 rows)
+    Test  : rows 3420–3799  → season  2024      (1 season,    380 rows)
+
+    Prints row count and FTR class distribution (counts + %) for each split.
+    No shuffling is performed to prevent temporal data leakage.
+    """
+    train = df.iloc[:_TRAIN_END].copy()
+    val = df.iloc[_TRAIN_END:_VAL_END].copy()
+    test = df.iloc[_VAL_END:].copy()
+
+    for name, split in [("Train", train), ("Val", val), ("Test", test)]:
+        total = len(split)
+        counts = split[TARGET_COLUMN].value_counts()
+        print(f"\n  {name} ({total:,} rows):")
+        for label in ("H", "D", "A"):
+            n = int(counts.get(label, 0))
+            print(f"    {label}: {n:>5}  ({n / total * 100:5.1f}%)")
+
+    return train, val, test
+
+
+def encode_features(
+    train: pd.DataFrame,
+    val: pd.DataFrame,
+    test: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, list]]:
+    """
+    Encode the target and categorical columns; drop the Date column.
+
+    FTR is mapped via TARGET_MAPPING (H→2, D→1, A→0).
+    HomeTeam, AwayTeam, and Referee are label-encoded using a LabelEncoder
+    fitted *only on the training split*.  Unseen labels in val or test receive
+    -1 and trigger a printed WARNING line.
+
+    Returns new DataFrames (not modified in-place) and a dict mapping each
+    categorical column name to the ordered list of fitted encoder classes
+    (for metadata).
+
+    FIX: changed from mixed in-place/return pattern to a pure return pattern
+    so callers always work with the returned objects.
+    """
+    # Work on copies so the originals passed in are never mutated
+    train = train.copy()
+    val = val.copy()
+    test = test.copy()
+
+    # Encode target
+    for split in (train, val, test):
+        split[TARGET_COLUMN] = split[TARGET_COLUMN].map(TARGET_MAPPING)
+
+    # Encode categoricals — fit only on training data
+    encoder_classes: dict[str, list] = {}
+    for col in CATEGORICAL_FEATURES:
+        le = LabelEncoder()
+        le.fit(train[col])
+        encoder_classes[col] = le.classes_.tolist()
+
+        label_map: dict[str, int] = {
+            cls: idx for idx, cls in enumerate(le.classes_)
+        }
+        train[col] = train[col].map(label_map)
+
+        for split_name, split in [("Val", val), ("Test", test)]:
+            unseen = sorted(set(split[col].unique()) - set(le.classes_))
+            if unseen:
+                print(
+                    f"  WARNING [{split_name}] '{col}' contains "
+                    f"{len(unseen)} unseen label(s): {unseen}. Assigning -1."
+                )
+            split[col] = split[col].map(lambda v, m=label_map: m.get(v, -1))
+
+    # Drop Date — no longer needed after the temporal split
+    train = train.drop(columns=[DATE_COLUMN])
+    val = val.drop(columns=[DATE_COLUMN])
+    test = test.drop(columns=[DATE_COLUMN])
+
+    # Print encoding summary
+    print(f"\n  {'Column':<15} {'Method':<20} {'Mapping / Notes'}")
+    print("  " + "-" * 75)
+    print(f"  {'FTR':<15} {'Manual mapping':<20} H→2, D→1, A→0")
+    print(f"  {'Date':<15} {'Dropped':<20} Not needed after temporal split")
+    for col in CATEGORICAL_FEATURES:
+        classes = encoder_classes[col]
+        sample = ", ".join(f"{c}→{i}" for i, c in enumerate(classes[:3]))
+        suffix = f"  … ({len(classes)} classes total)" if len(classes) > 3 else f"  ({len(classes)} classes total)"
+        print(f"  {col:<15} {'LabelEncoder':<20} {sample}{suffix}")
+    print(f"\n  Numerical features ({len(NUMERICAL_FEATURES)}): StandardScaler — applied in SCALING step")
+
+    return train, val, test, encoder_classes
+
+
+def scale_features(
+    X_train: pd.DataFrame,
+    X_val: pd.DataFrame,
+    X_test: pd.DataFrame,
+    numerical_cols: list[str],
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, StandardScaler]:
+    """
+    Fit a StandardScaler on training numerical columns; apply to val and test.
+
+    Encoded categorical columns and the target are intentionally excluded.
+    Returns copies of the three updated feature DataFrames and the fitted scaler.
+    """
+    scaler = StandardScaler()
+    X_train = X_train.copy()
+    X_val = X_val.copy()
+    X_test = X_test.copy()
+    X_train[numerical_cols] = scaler.fit_transform(X_train[numerical_cols])
+    X_val[numerical_cols] = scaler.transform(X_val[numerical_cols])
+    X_test[numerical_cols] = scaler.transform(X_test[numerical_cols])
+    return X_train, X_val, X_test, scaler
+
+
+def select_features(
+    X_train: pd.DataFrame,
+    X_val: pd.DataFrame,
+    X_test: pd.DataFrame,
+    y_train: pd.Series,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, dict[str, Any]]]:
+    """
+    Two-step feature selection computed on training data; same mask applied to val/test.
+
+    Pearson correlation is computed ONLY on numerical features — categorical
+    features (HomeTeam, AwayTeam, Referee) are excluded from both filter steps
+    and always kept, because Pearson correlation on label-encoded nominals is
+    statistically meaningless (the integer assignment is alphabetically arbitrary).
+
+    Step A — low-correlation filter:
+        Drop any numerical feature where |Pearson r with encoded target| < 0.03.
+
+    Step B — near-duplicate filter:
+        For every remaining numerical pair with |inter-feature r| > 0.97, drop
+        the member with the lower |r with target| (ties broken by column order).
+
+    Prints a formatted table of every dropped feature, its reason, and its
+    Pearson r value.  Returns the pruned splits and a dropped-features dict
+    ready for JSON serialisation.
+    """
+    # Only evaluate numerical features — exclude encoded categoricals
+    numerical_in_X = [c for c in NUMERICAL_FEATURES if c in X_train.columns]
+
+    target_corr: dict[str, float] = {
+        col: float(X_train[col].corr(y_train)) for col in numerical_in_X
+    }
+    abs_target_corr: dict[str, float] = {k: abs(v) for k, v in target_corr.items()}
+
+    dropped: dict[str, dict[str, Any]] = {}
+
+    # Step A — low correlation with target
+    for col, ac in abs_target_corr.items():
+        if ac < 0.03:
+            dropped[col] = {
+                "reason": "low_correlation_with_target",
+                "correlation": target_corr[col],
+            }
+
+    # Step B — near-duplicate pairs (greedy, evaluated on Step-A survivors)
+    remaining: list[str] = [c for c in numerical_in_X if c not in dropped]
+    inter_corr = X_train[remaining].corr().abs()
+    already_dropped: set[str] = set()
+
+    for i, c1 in enumerate(remaining):
+        for c2 in remaining[i + 1:]:
+            if c1 in already_dropped or c2 in already_dropped:
+                continue
+            if inter_corr.loc[c1, c2] > 0.97:
+                loser = c1 if abs_target_corr[c1] <= abs_target_corr[c2] else c2
+                already_dropped.add(loser)
+                dropped[loser] = {
+                    "reason": "near_duplicate_with_higher_corr_feature",
+                    "correlation": target_corr[loser],
+                }
+
+    # Report
+    if dropped:
+        print(f"\n  {'Feature':<25} {'Reason':<45} {'Corr':>8}")
+        print("  " + "-" * 80)
+        for feat, info in dropped.items():
+            print(
+                f"  {feat:<25} {info['reason']:<45} {info['correlation']:>8.4f}"
+            )
+
+    n_remain = len(X_train.columns) - len(dropped)
+    print(
+        f"\n  Dropped {len(dropped)} feature(s).  "
+        f"{n_remain} feature(s) remain."
+    )
+
+    # Categorical features are always kept; only drop from numerical set
+    keep: list[str] = [c for c in X_train.columns if c not in dropped]
+    return X_train[keep].copy(), X_val[keep].copy(), X_test[keep].copy(), dropped
+
+
+def apply_smote(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+) -> tuple[pd.DataFrame, pd.Series]:
+    """
+    Oversample minority class(es) in the training set using SMOTE (random_state=42).
+
+    Prints class distribution before and after resampling.
+    Only called when the --smote CLI flag is supplied.
+
+    NOTE: By default this pipeline does NOT apply SMOTE. The mild class imbalance
+    (H: 44.5%, D: 23.3%, A: 32.2%, ratio ~1.9:1) is handled at training time via
+    class_weight='balanced' on each model. Pass --smote only to run the explicit
+    oversampling experiment and compare Draw F1 against the default strategy.
+
+    FIX: both returned objects have their index reset so they remain aligned
+    after SMOTE introduces new synthetic rows.
+    """
+    from imblearn.over_sampling import SMOTE  # lazy import; guarded by CLI flag
+
+    def _print_dist(y: pd.Series, label: str) -> None:
+        total = len(y)
+        print(f"  {label}:")
+        for encoded, name in [(2, "H"), (1, "D"), (0, "A")]:
+            n = int((y == encoded).sum())
+            print(f"    {name} ({encoded}): {n:>6}  ({n / total * 100:5.1f}%)")
+
+    _print_dist(y_train, "Before")
+
+    sm = SMOTE(random_state=42)
+    X_res, y_res = sm.fit_resample(X_train.values, y_train.values)
+
+    # FIX: reset_index ensures X and y stay aligned if any downstream code
+    # joins them by index after SMOTE has introduced new synthetic rows
+    X_res_df = pd.DataFrame(X_res, columns=X_train.columns).reset_index(drop=True)
+    y_res_s = pd.Series(y_res, name=TARGET_COLUMN).reset_index(drop=True)
+
+    _print_dist(y_res_s, "After")
+
+    return X_res_df, y_res_s
+
+
+def save_outputs(
+    X_train: pd.DataFrame,
+    X_val: pd.DataFrame,
+    X_test: pd.DataFrame,
+    y_train: pd.Series,
+    y_val: pd.Series,
+    y_test: pd.Series,
+    scaler: StandardScaler,
+    all_numerical_cols: list[str],
+    encoder_classes: dict[str, list],
+    dropped_features: dict[str, dict[str, Any]],
+    smote_applied: bool,
+    output_dir: Path,
+) -> None:
+    """
+    Write the six CSV splits and preprocessing_metadata.json to output_dir.
+
+    CSV files: X_train, X_val, X_test, y_train, y_val, y_test (no row index).
+
+    The scaler was fitted on all_numerical_cols (pre-selection). After feature
+    selection some of those columns may have been dropped, so scaler_mean and
+    scaler_scale in metadata are filtered to only the numerical columns that
+    survived selection — keeping them aligned with feature_names so downstream
+    code (e.g. a Streamlit predictor) can correctly scale new inputs.
+
+    FIX: scaler_mean and scaler_scale are now filtered to surviving numerical
+    features only, preventing a length mismatch with feature_names.
+
+    Metadata fields written to preprocessing_metadata.json:
+        feature_names         — ordered feature list after selection
+        dropped_features      — {name: {reason, correlation}}
+        class_mapping         — {"H":2, "D":1, "A":0}
+        split_sizes           — {"train":N, "val":N, "test":N}
+        scaled_features       — numerical columns the scaler covers (post-selection)
+        scaler_mean           — list of floats aligned to scaled_features
+        scaler_scale          — list of floats aligned to scaled_features
+        label_encoder_classes — {col: [class, ...]}
+        smote_applied         — bool
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    for tag, obj in [
+        ("X_train", X_train), ("X_val", X_val), ("X_test", X_test),
+        ("y_train", y_train), ("y_val", y_val), ("y_test", y_test),
+    ]:
+        obj.to_csv(output_dir / f"{tag}.csv", index=False)
+
+    # FIX: filter scaler arrays to only the numerical features that survived
+    # feature selection, so they stay aligned with feature_names
+    surviving_numerical = [c for c in all_numerical_cols if c in X_train.columns]
+    surviving_idx = [all_numerical_cols.index(c) for c in surviving_numerical]
+
+    metadata: dict[str, Any] = {
+        "feature_names": X_train.columns.tolist(),
+        "dropped_features": dropped_features,
+        "class_mapping": TARGET_MAPPING,
+        "split_sizes": {
+            "train": len(X_train),
+            "val": len(X_val),
+            "test": len(X_test),
+        },
+        "scaled_features": surviving_numerical,
+        "scaler_mean": [scaler.mean_[i] for i in surviving_idx],
+        "scaler_scale": [scaler.scale_[i] for i in surviving_idx],
+        "label_encoder_classes": encoder_classes,
+        "smote_applied": smote_applied,
+    }
+    with open(output_dir / "preprocessing_metadata.json", "w") as f:
+        json.dump(metadata, f, indent=2)
+
+    print(f"\n  Written to {output_dir}/")
+    for tag in ("X_train", "X_val", "X_test", "y_train", "y_val", "y_test"):
+        print(f"    {tag}.csv")
+    print("    preprocessing_metadata.json")
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+
+def main() -> None:
+    """Parse CLI arguments and execute the full preprocessing pipeline."""
+    parser = argparse.ArgumentParser(
+        description=(
+            "Preprocess the enriched PL dataset for modelling. "
+            "Performs time-aware splitting, encoding, standard scaling, "
+            "Pearson-based feature selection, and optional SMOTE balancing."
+        )
+    )
+    parser.add_argument(
+        "--input",
+        required=True,
+        type=Path,
+        help="Path to the enriched dataset CSV (output of enrich.py).",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=Path("data/processed"),
+        type=Path,
+        help="Directory for output CSV files and metadata (default: data/processed/).",
+    )
+    parser.add_argument(
+        "--smote",
+        action="store_true",
+        help=(
+            "Apply SMOTE to the training set after feature selection. "
+            "Off by default — imbalance is handled via class_weight='balanced' "
+            "during model training instead. Use this flag only to run the "
+            "explicit oversampling experiment."
+        ),
+    )
+    args = parser.parse_args()
+
+    # ── Load ──────────────────────────────────────────────────────────────
+    print(f"Loading: {args.input}")
+    df = pd.read_csv(args.input)
+    print(f"Shape  : {df.shape[0]:,} rows × {df.shape[1]} columns")
+
+    validate_input(df)
+
+    # ── Split ─────────────────────────────────────────────────────────────
+    print("\nSPLIT")
+    train, val, test = split_data(df)
+
+    # ── Encode ────────────────────────────────────────────────────────────
+    print("\nENCODING")
+    train, val, test, encoder_classes = encode_features(train, val, test)
+
+    # ── Separate features / target ────────────────────────────────────────
+    X_train = train.drop(columns=[TARGET_COLUMN])
+    y_train = train[TARGET_COLUMN].rename(TARGET_COLUMN)
+    X_val = val.drop(columns=[TARGET_COLUMN])
+    y_val = val[TARGET_COLUMN].rename(TARGET_COLUMN)
+    X_test = test.drop(columns=[TARGET_COLUMN])
+    y_test = test[TARGET_COLUMN].rename(TARGET_COLUMN)
+
+    # ── Scale ─────────────────────────────────────────────────────────────
+    print("\n=== SCALING ===")
+    numerical_cols = [c for c in NUMERICAL_FEATURES if c in X_train.columns]
+    X_train, X_val, X_test, scaler = scale_features(
+        X_train, X_val, X_test, numerical_cols
+    )
+    print(f"  Scaled {len(numerical_cols)} numerical feature(s).")
+
+    # ── Feature selection ─────────────────────────────────────────────────
+    print("\n=== FEATURE SELECTION ===")
+    X_train, X_val, X_test, dropped_features = select_features(
+        X_train, X_val, X_test, y_train
+    )
+
+    # ── SMOTE (optional) ──────────────────────────────────────────────────
+    smote_applied = False
+    if args.smote:
+        print("\n=== SMOTE ===")
+        X_train, y_train = apply_smote(X_train, y_train)
+        smote_applied = True
+
+    # ── Save ──────────────────────────────────────────────────────────────
+    print("\n=== SAVE ===")
+    save_outputs(
+        X_train, X_val, X_test,
+        y_train, y_val, y_test,
+        scaler,
+        numerical_cols,       # full pre-selection list; save_outputs filters internally
+        encoder_classes,
+        dropped_features,
+        smote_applied,
+        args.output_dir,
+    )
+
+
+if __name__ == "__main__":
+    main()

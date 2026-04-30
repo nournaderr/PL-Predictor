@@ -305,7 +305,7 @@ def page_boxplots_by_target(pdf: PdfPages, df: pd.DataFrame) -> None:
         order = ["H", "D", "A"]
         for ax, col in zip(axes_flat, present):
             groups = [df[df[TARGET_COL] == o][col].dropna().values for o in order]
-            bp = ax.boxplot(groups, patch_artist=True, labels=order, notch=False, widths=0.45)
+            bp = ax.boxplot(groups, patch_artist=True, tick_labels=order, notch=False, widths=0.45)
             for patch, lbl in zip(bp["boxes"], order):
                 patch.set_facecolor(PALETTE[lbl])
                 patch.set_alpha(0.82)
@@ -363,7 +363,7 @@ def page_position_analysis(pdf: PdfPages, df: pd.DataFrame) -> None:
     order = ["H", "D", "A"]
     for ax, col, label in zip(axes, ["HPOS", "APOS"], ["Home Team Position", "Away Team Position"]):
         groups = [df[df[TARGET_COL] == o][col].dropna().values for o in order]
-        bp = ax.boxplot(groups, patch_artist=True, labels=order, notch=False, widths=0.45)
+        bp = ax.boxplot(groups, patch_artist=True, tick_labels=order, notch=False, widths=0.45)
         for patch, lbl in zip(bp["boxes"], order):
             patch.set_facecolor(PALETTE[lbl])
             patch.set_alpha(0.82)
@@ -395,7 +395,7 @@ def page_derived_goal_differentials(pdf: PdfPages, df: pd.DataFrame) -> None:
     for ax, (col_a, col_b, title) in zip(axes.flatten(), derived):
         diff = df[col_a] - df[col_b]
         groups = [diff[df[TARGET_COL] == o].dropna().values for o in order]
-        bp = ax.boxplot(groups, patch_artist=True, labels=order, notch=False, widths=0.45)
+        bp = ax.boxplot(groups, patch_artist=True, tick_labels=order, notch=False, widths=0.45)
         for patch, lbl in zip(bp["boxes"], order):
             patch.set_facecolor(PALETTE[lbl])
             patch.set_alpha(0.82)
