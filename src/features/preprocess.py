@@ -1,26 +1,10 @@
-"""
-preprocess.py — Preprocessing pipeline for PL-Predictor.
-
-Sits between enrich.py (feature engineering) and the modelling step.
-Performs time-aware splitting, target/categorical encoding, standard scaling,
-Pearson-based feature selection, and optional SMOTE oversampling.
-
-Usage:
-    python preprocess.py --input data/processed/dataset.csv \\
-                         --output-dir data/processed/
-    python preprocess.py --input data/processed/dataset.csv \\
-                         --output-dir data/processed/ --smote
-"""
-
 from __future__ import annotations
-
 import argparse
 import json
 from pathlib import Path
 from typing import Any
-
 import pandas as pd
-from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.preprocessing import StandardScaler
 
 
 NUMERICAL_FEATURES: list[str] = [
@@ -51,11 +35,6 @@ REQUIRED_COLUMNS: list[str] = (
 _TRAIN_END: int = 3040   # rows 0–3039   → seasons 2015–2022
 _VAL_END: int = 3420     # rows 3040–3419 → season 2023
 
-# ---------------------------------------------------------------------------
-# Pipeline steps
-# ---------------------------------------------------------------------------
-
-
 def validate_input(df: pd.DataFrame) -> None:
     """Raise ValueError listing every missing required column before processing begins."""
     missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
@@ -65,18 +44,11 @@ def validate_input(df: pd.DataFrame) -> None:
             + "\n".join(f"  - {c}" for c in missing)
         )
 
-
 def split_data(
     df: pd.DataFrame,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Return (train, val, test) using a fixed time-aware row split with no shuffling.
-
-    Train : rows    0–3039  → seasons 2015–2022 (8 seasons, 3 040 rows)
-    Val   : rows 3040–3419  → season  2023      (1 season,    380 rows)
-    Test  : rows 3420–3799  → season  2024      (1 season,    380 rows)
-
-    Prints row count and FTR class distribution (counts + %) for each split.
     No shuffling is performed to prevent temporal data leakage.
     """
     train = df.iloc[:_TRAIN_END].copy()
@@ -103,18 +75,23 @@ def encode_features(
     Encode the target and categorical columns; drop the Date column.
 
     FTR is mapped via TARGET_MAPPING (H→2, D→1, A→0).
-    HomeTeam, AwayTeam, and Referee are label-encoded using a LabelEncoder
-    fitted *only on the training split*.  Unseen labels in val or test receive
-    -1 and trigger a printed WARNING line.
+
+    HomeTeam and AwayTeam are ordinally encoded by cumulative wins in the
+    training set — teams with more historical wins receive higher integers.
+    This creates a meaningful ordinal relationship (stronger team = higher
+    value) that tree-based models can exploit via threshold splits, unlike
+    alphabetical LabelEncoding which implies an arbitrary order.
+
+    Referee is ordinally encoded by matches officiated in training data —
+    more experienced referees receive higher integers.
+
+    Encoding is fitted ONLY on training data, then applied to val and test.
+    Unseen labels (promoted teams, new referees) receive -1 with a warning.
 
     Returns new DataFrames (not modified in-place) and a dict mapping each
-    categorical column name to the ordered list of fitted encoder classes
-    (for metadata).
-
-    FIX: changed from mixed in-place/return pattern to a pure return pattern
-    so callers always work with the returned objects.
+    categorical column name to the ordered list of classes (low→high rank)
+    for metadata.
     """
-    # Work on copies so the originals passed in are never mutated
     train = train.copy()
     val = val.copy()
     test = test.copy()
@@ -123,46 +100,81 @@ def encode_features(
     for split in (train, val, test):
         split[TARGET_COLUMN] = split[TARGET_COLUMN].map(TARGET_MAPPING)
 
-    # Encode categoricals — fit only on training data
     encoder_classes: dict[str, list] = {}
-    for col in CATEGORICAL_FEATURES:
-        le = LabelEncoder()
-        le.fit(train[col])
-        encoder_classes[col] = le.classes_.tolist()
 
-        label_map: dict[str, int] = {
-            cls: idx for idx, cls in enumerate(le.classes_)
-        }
-        train[col] = train[col].map(label_map)
+    # ── HomeTeam & AwayTeam: rank by total wins in training data ──────────
+    home_wins = (
+        train[train["HomeTeam"].notna()]
+        .groupby("HomeTeam")
+        .apply(lambda g: (g[TARGET_COLUMN] == TARGET_MAPPING["H"]).sum())
+    )
+    away_wins = (
+        train[train["AwayTeam"].notna()]
+        .groupby("AwayTeam")
+        .apply(lambda g: (g[TARGET_COLUMN] == TARGET_MAPPING["A"]).sum())
+    )
+    all_teams = sorted(set(home_wins.index) | set(away_wins.index))
+    total_wins = {
+        team: int(home_wins.get(team, 0)) + int(away_wins.get(team, 0))
+        for team in all_teams
+    }
+    # Sort ascending by wins so highest-win team gets the highest integer
+    teams_ranked = sorted(all_teams, key=lambda t: total_wins[t])
+    team_rank_map: dict[str, int] = {
+        team: rank for rank, team in enumerate(teams_ranked)
+    }
+    encoder_classes["HomeTeam"] = teams_ranked
+    encoder_classes["AwayTeam"] = teams_ranked
 
-        for split_name, split in [("Val", val), ("Test", test)]:
-            unseen = sorted(set(split[col].unique()) - set(le.classes_))
-            if unseen:
+    for col in ("HomeTeam", "AwayTeam"):
+        for split_name, split in [("Train", train), ("Val", val), ("Test", test)]:
+            unseen = sorted(set(split[col].dropna()) - set(team_rank_map))
+            if unseen and split_name != "Train":
                 print(
                     f"  WARNING [{split_name}] '{col}' contains "
                     f"{len(unseen)} unseen label(s): {unseen}. Assigning -1."
                 )
-            split[col] = split[col].map(lambda v, m=label_map: m.get(v, -1))
+            split[col] = split[col].map(lambda v, m=team_rank_map: m.get(v, -1))
 
-    # Drop Date — no longer needed after the temporal split
+    # ── Referee: rank by matches officiated in training data ──────────────
+    ref_counts = train["Referee"].value_counts()
+    refs_ranked = ref_counts.index[::-1].tolist()  # least→most experienced
+    ref_rank_map: dict[str, int] = {
+        ref: rank for rank, ref in enumerate(refs_ranked)
+    }
+    encoder_classes["Referee"] = refs_ranked
+
+    for split_name, split in [("Train", train), ("Val", val), ("Test", test)]:
+        unseen = sorted(set(split["Referee"].dropna()) - set(ref_rank_map))
+        if unseen and split_name != "Train":
+            print(
+                f"  WARNING [{split_name}] 'Referee' contains "
+                f"{len(unseen)} unseen label(s): {unseen}. Assigning -1."
+            )
+        split["Referee"] = split["Referee"].map(
+            lambda v, m=ref_rank_map: m.get(v, -1)
+        )
+
+    # Drop Date
     train = train.drop(columns=[DATE_COLUMN])
     val = val.drop(columns=[DATE_COLUMN])
     test = test.drop(columns=[DATE_COLUMN])
 
     # Print encoding summary
-    print(f"\n  {'Column':<15} {'Method':<20} {'Mapping / Notes'}")
+    top3_teams = teams_ranked[-3:]
+    bot3_teams = teams_ranked[:3]
+    print(f"\n  {'Column':<15} {'Method':<25} {'Details'}")
     print("  " + "-" * 75)
-    print(f"  {'FTR':<15} {'Manual mapping':<20} H→2, D→1, A→0")
-    print(f"  {'Date':<15} {'Dropped':<20} Not needed after temporal split")
-    for col in CATEGORICAL_FEATURES:
-        classes = encoder_classes[col]
-        sample = ", ".join(f"{c}→{i}" for i, c in enumerate(classes[:3]))
-        suffix = f"  … ({len(classes)} classes total)" if len(classes) > 3 else f"  ({len(classes)} classes total)"
-        print(f"  {col:<15} {'LabelEncoder':<20} {sample}{suffix}")
+    print(f"  {'FTR':<15} {'Manual mapping':<25} H→2, D→1, A→0")
+    print(f"  {'Date':<15} {'Dropped':<25} Not needed after temporal split")
+    print(f"  {'HomeTeam':<15} {'Ordinal (wins)':<25} "
+          f"weakest→0: {bot3_teams}  …  strongest→{len(teams_ranked)-1}: {top3_teams}")
+    print(f"  {'AwayTeam':<15} {'Ordinal (wins)':<25} same mapping as HomeTeam")
+    print(f"  {'Referee':<15} {'Ordinal (matches)':<25} "
+          f"least experienced→0, most→{len(refs_ranked)-1}  ({len(refs_ranked)} referees)")
     print(f"\n  Numerical features ({len(NUMERICAL_FEATURES)}): StandardScaler — applied in SCALING step")
 
     return train, val, test, encoder_classes
-
 
 def scale_features(
     X_train: pd.DataFrame,
@@ -245,8 +257,6 @@ def select_features(
                     "reason": "near_duplicate_with_higher_corr_feature",
                     "correlation": target_corr[loser],
                 }
-
-    # Report
     if dropped:
         print(f"\n  {'Feature':<25} {'Reason':<45} {'Corr':>8}")
         print("  " + "-" * 80)
@@ -355,8 +365,6 @@ def save_outputs(
     ]:
         obj.to_csv(output_dir / f"{tag}.csv", index=False)
 
-    # FIX: filter scaler arrays to only the numerical features that survived
-    # feature selection, so they stay aligned with feature_names
     surviving_numerical = [c for c in all_numerical_cols if c in X_train.columns]
     surviving_idx = [all_numerical_cols.index(c) for c in surviving_numerical]
 
@@ -382,11 +390,6 @@ def save_outputs(
     for tag in ("X_train", "X_val", "X_test", "y_train", "y_val", "y_test"):
         print(f"    {tag}.csv")
     print("    preprocessing_metadata.json")
-
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
 
 
 def main() -> None:
@@ -422,22 +425,18 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    # ── Load ──────────────────────────────────────────────────────────────
     print(f"Loading: {args.input}")
     df = pd.read_csv(args.input)
     print(f"Shape  : {df.shape[0]:,} rows × {df.shape[1]} columns")
 
     validate_input(df)
 
-    # ── Split ─────────────────────────────────────────────────────────────
     print("\nSPLIT")
     train, val, test = split_data(df)
 
-    # ── Encode ────────────────────────────────────────────────────────────
     print("\nENCODING")
     train, val, test, encoder_classes = encode_features(train, val, test)
 
-    # ── Separate features / target ────────────────────────────────────────
     X_train = train.drop(columns=[TARGET_COLUMN])
     y_train = train[TARGET_COLUMN].rename(TARGET_COLUMN)
     X_val = val.drop(columns=[TARGET_COLUMN])
@@ -445,29 +444,25 @@ def main() -> None:
     X_test = test.drop(columns=[TARGET_COLUMN])
     y_test = test[TARGET_COLUMN].rename(TARGET_COLUMN)
 
-    # ── Scale ─────────────────────────────────────────────────────────────
-    print("\n=== SCALING ===")
+    print("\nSCALING")
     numerical_cols = [c for c in NUMERICAL_FEATURES if c in X_train.columns]
     X_train, X_val, X_test, scaler = scale_features(
         X_train, X_val, X_test, numerical_cols
     )
     print(f"  Scaled {len(numerical_cols)} numerical feature(s).")
 
-    # ── Feature selection ─────────────────────────────────────────────────
-    print("\n=== FEATURE SELECTION ===")
+    print("\nFEATURE SELECTION")
     X_train, X_val, X_test, dropped_features = select_features(
         X_train, X_val, X_test, y_train
     )
 
-    # ── SMOTE (optional) ──────────────────────────────────────────────────
     smote_applied = False
     if args.smote:
-        print("\n=== SMOTE ===")
+        print("\nSMOTE")
         X_train, y_train = apply_smote(X_train, y_train)
         smote_applied = True
 
-    # ── Save ──────────────────────────────────────────────────────────────
-    print("\n=== SAVE ===")
+    print("\nSAVE")
     save_outputs(
         X_train, X_val, X_test,
         y_train, y_val, y_test,
