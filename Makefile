@@ -30,7 +30,11 @@ eda:
 		--input data/processed/enriched_dataset.csv \
 		--output data/processed/vis.pdf
 
-pipeline: construct validate clean-data enrich eda
+feature-selection:
+	poetry run python src/features/preprocess.py \
+	--input data/processed/enriched_dataset.csv \
+	--output data/processed/
+pipeline: construct validate clean-data enrich eda feature-selection
 
 # --- ML ---
 
