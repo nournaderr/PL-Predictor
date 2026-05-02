@@ -5,9 +5,14 @@ from pathlib import Path
 from typing import Any
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
+from sklearn.feature_selection import mutual_info_classif
 
 
 NUMERICAL_FEATURES: list[str] = [
+    # All 50 engineered numerical features from enrich.py.
+    # Venue-split deduplication (e.g. HPPG vs HPPGH) is handled in
+    # select_features Step 0, which picks the better variant per pair
+    # based on correlation with the target — not hardcoded here.
     "HPPG", "HPPGH", "HPPG_FORM", "HPPGH_FORM",
     "APPG", "APPGA", "APPG_FORM", "APPGA_FORM",
     "HGS", "HGSH", "HGS_FORM", "HGSH_FORM",
@@ -30,6 +35,28 @@ TARGET_MAPPING: dict[str, int] = {"H": 2, "D": 1, "A": 0}
 REQUIRED_COLUMNS: list[str] = (
     NUMERICAL_FEATURES + CATEGORICAL_FEATURES + [TARGET_COLUMN, DATE_COLUMN]
 )
+
+# Each tuple is (overall_stat, venue_specific_stat).  At preprocessing time
+# exactly one from each pair is kept — whichever correlates more strongly with
+# the target on the training set.  The choice is data-driven, not hardcoded.
+VENUE_SPLIT_PAIRS: list[tuple[str, str]] = [
+    ("HPPG",      "HPPGH"),
+    ("HPPG_FORM", "HPPGH_FORM"),
+    ("APPG",      "APPGA"),
+    ("APPG_FORM", "APPGA_FORM"),
+    ("HGS",       "HGSH"),
+    ("HGS_FORM",  "HGSH_FORM"),
+    ("AGS",       "AGSA"),
+    ("AGS_FORM",  "AGSA_FORM"),
+    ("HGC",       "HGCH"),
+    ("HGC_FORM",  "HGCH_FORM"),
+    ("AGC",       "AGCA"),
+    ("AGC_FORM",  "AGCA_FORM"),
+    ("HCS",       "HCSH"),
+    ("HCS_FORM",  "HCSH_FORM"),
+    ("ACS",       "ACSA"),
+    ("ACS_FORM",  "ACSA_FORM"),
+]
 
 # Row boundaries for the time-aware split (upper bounds are exclusive)
 _TRAIN_END: int = 3040   # rows 0–3039   → seasons 2015–2022
@@ -203,25 +230,35 @@ def select_features(
     X_val: pd.DataFrame,
     X_test: pd.DataFrame,
     y_train: pd.Series,
+    *,
+    pearson_threshold: float = 0.05,
+    inter_corr_threshold: float = 0.95,
+    mi_top_k: int = 20,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, dict[str, Any]]]:
     """
-    Two-step feature selection computed on training data; same mask applied to val/test.
+    Three-step feature selection computed on training data; same mask applied to val/test.
 
     Pearson correlation is computed ONLY on numerical features — categorical
-    features (HomeTeam, AwayTeam, Referee) are excluded from both filter steps
+    features (HomeTeam, AwayTeam, Referee) are excluded from all filter steps
     and always kept, because Pearson correlation on label-encoded nominals is
     statistically meaningless (the integer assignment is alphabetically arbitrary).
 
-    Step A — low-correlation filter:
-        Drop any numerical feature where |Pearson r with encoded target| < 0.03.
+    Step A — low Pearson filter (threshold 0.05):
+        Drop any numerical feature where |Pearson r with encoded target| < 0.05.
+        Tightened from the original 0.03 to remove more weak linear signals.
 
-    Step B — near-duplicate filter:
-        For every remaining numerical pair with |inter-feature r| > 0.97, drop
-        the member with the lower |r with target| (ties broken by column order).
+    Step B — near-duplicate filter (threshold 0.95):
+        For every remaining numerical pair with |inter-feature r| > 0.95, drop
+        the member with the lower |r with target|. Tightened from 0.97 to catch
+        more venue-split duplicates (e.g. HGS vs HGSH).
 
-    Prints a formatted table of every dropped feature, its reason, and its
-    Pearson r value.  Returns the pruned splits and a dropped-features dict
-    ready for JSON serialisation.
+    Step C — Mutual Information top-k filter (k=20):
+        Fit a MI classifier on Step-B survivors; keep only the top 20 numerical
+        features by MI score. MI captures non-linear dependence missed by Pearson,
+        removing features weakly related to the target regardless of linear
+        correlation. Significantly reduces overfitting.
+
+    Returns the pruned splits and a dropped-features dict for JSON serialisation.
     """
     # Only evaluate numerical features — exclude encoded categoricals
     numerical_in_X = [c for c in NUMERICAL_FEATURES if c in X_train.columns]
@@ -233,15 +270,66 @@ def select_features(
 
     dropped: dict[str, dict[str, Any]] = {}
 
-    # Step A — low correlation with target
+    # ── Step 0 — venue-split pair deduplication ───────────────────────────────
+    # Each stat has two variants: overall (e.g. HPPG) and venue-specific (HPPGH).
+    # We auto-detect pairs by checking whether appending "H" or "A" to a feature
+    # name yields another feature in the column set — no hardcoded list needed.
+    # For each detected pair we drop the member with the lower |r with target|.
+    col_set = set(numerical_in_X)
+    seen_pairs: set[frozenset] = set()
+    venue_pairs: list[tuple[str, str]] = []
+
+    for col in numerical_in_X:
+        if col.endswith("_FORM"):
+            base = col[:-5]          # strip _FORM  → e.g. "HPPG"
+            for suffix in ("H", "A"):
+                partner = base + suffix + "_FORM"   # e.g. "HPPGH_FORM"
+                if partner in col_set:
+                    key = frozenset({col, partner})
+                    if key not in seen_pairs:
+                        seen_pairs.add(key)
+                        venue_pairs.append((col, partner))
+        else:
+            for suffix in ("H", "A"):
+                partner = col + suffix              # e.g. "HPPGH"
+                if partner in col_set:
+                    key = frozenset({col, partner})
+                    if key not in seen_pairs:
+                        seen_pairs.add(key)
+                        venue_pairs.append((col, partner))
+
+    print(f"\n  {'Pair':<36} {'Kept':<16} {'Dropped':<16} |r| keep / drop")
+    print("  " + "-" * 85)
+    for col_a, col_b in venue_pairs:
+        r_a = abs_target_corr[col_a]
+        r_b = abs_target_corr[col_b]
+        winner, loser = (col_a, col_b) if r_a >= r_b else (col_b, col_a)
+        dropped[loser] = {
+            "reason": "venue_split_duplicate",
+            "correlation": target_corr[loser],
+            "kept_instead": winner,
+            "kept_correlation": target_corr[winner],
+        }
+        print(
+            f"  {col_a:<16} vs {col_b:<16}  "
+            f"keep={winner:<16} drop={loser:<16} "
+            f"{abs_target_corr[winner]:.4f} / {abs_target_corr[loser]:.4f}"
+        )
+
+    # ── Step A — low Pearson correlation with target ─────────────────────────
+    # Removes features that have almost no linear relationship with the outcome.
+    # Threshold is configurable via --pearson-threshold (default 0.05).
     for col, ac in abs_target_corr.items():
-        if ac < 0.03:
+        if col not in dropped and ac < pearson_threshold:
             dropped[col] = {
-                "reason": "low_correlation_with_target",
+                "reason": "low_pearson_with_target",
                 "correlation": target_corr[col],
             }
 
-    # Step B — near-duplicate pairs (greedy, evaluated on Step-A survivors)
+    # ── Step B — near-duplicate pairs ────────────────────────────────────────
+    # Greedily removes one member of any highly-correlated pair, keeping the
+    # one with stronger target correlation.
+    # Threshold is configurable via --inter-corr-threshold (default 0.95).
     remaining: list[str] = [c for c in numerical_in_X if c not in dropped]
     inter_corr = X_train[remaining].corr().abs()
     already_dropped: set[str] = set()
@@ -250,26 +338,57 @@ def select_features(
         for c2 in remaining[i + 1:]:
             if c1 in already_dropped or c2 in already_dropped:
                 continue
-            if inter_corr.loc[c1, c2] > 0.97:
+            if inter_corr.loc[c1, c2] > inter_corr_threshold:
                 loser = c1 if abs_target_corr[c1] <= abs_target_corr[c2] else c2
                 already_dropped.add(loser)
                 dropped[loser] = {
                     "reason": "near_duplicate_with_higher_corr_feature",
                     "correlation": target_corr[loser],
                 }
-    if dropped:
-        print(f"\n  {'Feature':<25} {'Reason':<45} {'Corr':>8}")
-        print("  " + "-" * 80)
-        for feat, info in dropped.items():
-            print(
-                f"  {feat:<25} {info['reason']:<45} {info['correlation']:>8.4f}"
-            )
+
+    # ── Step C — Mutual Information top-k filter ──────────────────────────────
+    # MI measures non-linear statistical dependence and is therefore a better
+    # relevance signal than Pearson for tree-based models. We compute MI scores
+    # on Step-B survivors and keep only the top mi_top_k numerical features.
+    # Configurable via --mi-top-k (default 20). Pass 0 to skip this step.
+    survivors_after_ab: list[str] = [
+        c for c in numerical_in_X if c not in dropped and c not in already_dropped
+    ]
+
+    if mi_top_k > 0 and len(survivors_after_ab) > mi_top_k:
+        mi_scores = mutual_info_classif(
+            X_train[survivors_after_ab],
+            y_train,
+            discrete_features=False,
+            random_state=42,
+        )
+        mi_series = pd.Series(mi_scores, index=survivors_after_ab).sort_values(ascending=False)
+        mi_keep = set(mi_series.iloc[:mi_top_k].index)
+        mi_drop = [c for c in survivors_after_ab if c not in mi_keep]
+
+        for col in mi_drop:
+            dropped[col] = {
+                "reason": f"low_mutual_information (kept top {mi_top_k})",
+                "correlation": target_corr.get(col, 0.0),
+                "mi_score": float(mi_series[col]),
+            }
+
+        print(f"\n  Mutual Information scores (top {mi_top_k} kept out of {len(survivors_after_ab)}):")
+        print(f"  {'Feature':<25} {'MI Score':>10}  {'Status'}")
+        print("  " + "-" * 55)
+        for feat, score in mi_series.items():
+            status = "kept" if feat in mi_keep else "dropped"
+            marker = "✓" if status == "kept" else "✗"
+            print(f"  {feat:<25} {score:>10.4f}  {marker} {status}")
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    print(f"\n  Step 0 (venue-split pairs)             : dropped {sum(1 for v in dropped.values() if v['reason'] == 'venue_split_duplicate')} feature(s)")
+    print(f"  Step A (low Pearson < {pearson_threshold})        : dropped {sum(1 for v in dropped.values() if 'pearson' in v['reason'])} feature(s)")
+    print(f"  Step B (near-duplicate r > {inter_corr_threshold})  : dropped {sum(1 for v in dropped.values() if 'near_duplicate' in v['reason'])} feature(s)")
+    print(f"  Step C (low MI, kept top {mi_top_k})          : dropped {sum(1 for v in dropped.values() if 'mutual_information' in v['reason'])} feature(s)")
 
     n_remain = len(X_train.columns) - len(dropped)
-    print(
-        f"\n  Dropped {len(dropped)} feature(s).  "
-        f"{n_remain} feature(s) remain."
-    )
+    print(f"\n  Total dropped: {len(dropped)} feature(s). {n_remain} feature(s) remain.")
 
     # Categorical features are always kept; only drop from numerical set
     keep: list[str] = [c for c in X_train.columns if c not in dropped]
@@ -423,6 +542,37 @@ def main() -> None:
             "explicit oversampling experiment."
         ),
     )
+    parser.add_argument(
+        "--pearson-threshold",
+        type=float,
+        default=0.05,
+        metavar="THRESH",
+        help=(
+            "Drop numerical features whose |Pearson r with target| < THRESH. "
+            "Lower = keep more features. (default: 0.05)"
+        ),
+    )
+    parser.add_argument(
+        "--inter-corr-threshold",
+        type=float,
+        default=0.95,
+        metavar="THRESH",
+        help=(
+            "Drop one feature from every pair whose |inter-feature r| > THRESH, "
+            "keeping the one more correlated with the target. "
+            "Lower = remove more near-duplicates. (default: 0.95)"
+        ),
+    )
+    parser.add_argument(
+        "--mi-top-k",
+        type=int,
+        default=20,
+        metavar="K",
+        help=(
+            "Keep only the top K numerical features by Mutual Information score. "
+            "Pass 0 to disable this step entirely. (default: 20)"
+        ),
+    )
     args = parser.parse_args()
 
     print(f"Loading: {args.input}")
@@ -452,8 +602,14 @@ def main() -> None:
     print(f"  Scaled {len(numerical_cols)} numerical feature(s).")
 
     print("\nFEATURE SELECTION")
+    print(f"  pearson-threshold  : {args.pearson_threshold}")
+    print(f"  inter-corr-threshold: {args.inter_corr_threshold}")
+    print(f"  mi-top-k           : {args.mi_top_k} ({'disabled' if args.mi_top_k == 0 else 'active'})")
     X_train, X_val, X_test, dropped_features = select_features(
-        X_train, X_val, X_test, y_train
+        X_train, X_val, X_test, y_train,
+        pearson_threshold=args.pearson_threshold,
+        inter_corr_threshold=args.inter_corr_threshold,
+        mi_top_k=args.mi_top_k,
     )
 
     smote_applied = False
