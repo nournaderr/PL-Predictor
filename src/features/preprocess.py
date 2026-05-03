@@ -103,17 +103,24 @@ def encode_features(
 
     FTR is mapped via TARGET_MAPPING (H→2, D→1, A→0).
 
-    HomeTeam and AwayTeam are ordinally encoded by cumulative wins in the
-    training set — teams with more historical wins receive higher integers.
-    This creates a meaningful ordinal relationship (stronger team = higher
-    value) that tree-based models can exploit via threshold splits, unlike
-    alphabetical LabelEncoding which implies an arbitrary order.
+    HomeTeam and AwayTeam are ordinally encoded by cumulative points in the
+    training set — teams with more historical points receive higher integers.
+    Points are computed as wins×3 + draws×1, matching the actual league
+    table formula.  Using points rather than wins alone ensures draw-heavy
+    teams are not penalised, since draws earn a real league point and are
+    predictively meaningful.  This creates a meaningful ordinal relationship
+    (stronger team = higher value) that tree-based models can exploit via
+    threshold splits, unlike alphabetical LabelEncoding which implies an
+    arbitrary order.
 
     Referee is ordinally encoded by matches officiated in training data —
     more experienced referees receive higher integers.
 
     Encoding is fitted ONLY on training data, then applied to val and test.
-    Unseen labels (promoted teams, new referees) receive -1 with a warning.
+    Unseen labels (promoted teams, new referees) receive the median rank
+    rather than -1.  The median is a neutral, in-range assumption; -1 sits
+    below the entire learned range and signals "worse than the worst seen
+    team", which is inaccurate for a newly promoted side.
 
     Returns new DataFrames (not modified in-place) and a dict mapping each
     categorical column name to the ordered list of classes (low→high rank)
@@ -129,29 +136,47 @@ def encode_features(
 
     encoder_classes: dict[str, list] = {}
 
-    # ── HomeTeam & AwayTeam: rank by total wins in training data ──────────
-    home_wins = (
+    # ── HomeTeam & AwayTeam: rank by total points in training data ───────
+    # FIX: use points (win=3, draw=1) instead of wins only.  Draws earn a
+    # real league point and ignoring them understates the strength of
+    # draw-heavy teams, which distorts the ordinal signal.
+    # include_groups=False silences the pandas ≥ 2.2 deprecation warning.
+    home_points = (
         train[train["HomeTeam"].notna()]
-        .groupby("HomeTeam")
-        .apply(lambda g: (g[TARGET_COLUMN] == TARGET_MAPPING["H"]).sum())
+        .groupby("HomeTeam", group_keys=False)
+        .apply(
+            lambda g: (g[TARGET_COLUMN] == TARGET_MAPPING["H"]).sum() * 3
+                    + (g[TARGET_COLUMN] == TARGET_MAPPING["D"]).sum() * 1,
+            include_groups=False,
+        )
     )
-    away_wins = (
+    away_points = (
         train[train["AwayTeam"].notna()]
-        .groupby("AwayTeam")
-        .apply(lambda g: (g[TARGET_COLUMN] == TARGET_MAPPING["A"]).sum())
+        .groupby("AwayTeam", group_keys=False)
+        .apply(
+            lambda g: (g[TARGET_COLUMN] == TARGET_MAPPING["A"]).sum() * 3
+                    + (g[TARGET_COLUMN] == TARGET_MAPPING["D"]).sum() * 1,
+            include_groups=False,
+        )
     )
-    all_teams = sorted(set(home_wins.index) | set(away_wins.index))
-    total_wins = {
-        team: int(home_wins.get(team, 0)) + int(away_wins.get(team, 0))
+    all_teams = sorted(set(home_points.index) | set(away_points.index))
+    total_points = {
+        team: int(home_points.get(team, 0)) + int(away_points.get(team, 0))
         for team in all_teams
     }
-    # Sort ascending by wins so highest-win team gets the highest integer
-    teams_ranked = sorted(all_teams, key=lambda t: total_wins[t])
+    # Sort ascending so the highest-points team gets the highest integer.
+    teams_ranked = sorted(all_teams, key=lambda t: total_points[t])
     team_rank_map: dict[str, int] = {
         team: rank for rank, team in enumerate(teams_ranked)
     }
     encoder_classes["HomeTeam"] = teams_ranked
     encoder_classes["AwayTeam"] = teams_ranked
+
+    # FIX: unseen teams (e.g. promoted clubs) fall back to the median rank
+    # rather than -1.  -1 sits below the entire learned range [0, N-1] and
+    # signals "worse than the worst seen team", which is inaccurate for a
+    # newly promoted side.  The median is a neutral, in-range assumption.
+    team_fallback = len(teams_ranked) // 2
 
     for col in ("HomeTeam", "AwayTeam"):
         for split_name, split in [("Train", train), ("Val", val), ("Test", test)]:
@@ -159,9 +184,12 @@ def encode_features(
             if unseen and split_name != "Train":
                 print(
                     f"  WARNING [{split_name}] '{col}' contains "
-                    f"{len(unseen)} unseen label(s): {unseen}. Assigning -1."
+                    f"{len(unseen)} unseen label(s): {unseen}. "
+                    f"Assigning median rank {team_fallback}."
                 )
-            split[col] = split[col].map(lambda v, m=team_rank_map: m.get(v, -1))
+            split[col] = split[col].map(
+                lambda v, m=team_rank_map, fb=team_fallback: m.get(v, fb)
+            )
 
     # ── Referee: rank by matches officiated in training data ──────────────
     ref_counts = train["Referee"].value_counts()
@@ -170,16 +198,18 @@ def encode_features(
         ref: rank for rank, ref in enumerate(refs_ranked)
     }
     encoder_classes["Referee"] = refs_ranked
+    ref_fallback = len(refs_ranked) // 2
 
     for split_name, split in [("Train", train), ("Val", val), ("Test", test)]:
         unseen = sorted(set(split["Referee"].dropna()) - set(ref_rank_map))
         if unseen and split_name != "Train":
             print(
                 f"  WARNING [{split_name}] 'Referee' contains "
-                f"{len(unseen)} unseen label(s): {unseen}. Assigning -1."
+                f"{len(unseen)} unseen label(s): {unseen}. "
+                f"Assigning median rank {ref_fallback}."
             )
         split["Referee"] = split["Referee"].map(
-            lambda v, m=ref_rank_map: m.get(v, -1)
+            lambda v, m=ref_rank_map, fb=ref_fallback: m.get(v, fb)
         )
 
     # Drop Date
@@ -194,9 +224,9 @@ def encode_features(
     print("  " + "-" * 75)
     print(f"  {'FTR':<15} {'Manual mapping':<25} H→2, D→1, A→0")
     print(f"  {'Date':<15} {'Dropped':<25} Not needed after temporal split")
-    print(f"  {'HomeTeam':<15} {'Ordinal (wins)':<25} "
+    print(f"  {'HomeTeam':<15} {'Ordinal (points)':<25} "
           f"weakest→0: {bot3_teams}  …  strongest→{len(teams_ranked)-1}: {top3_teams}")
-    print(f"  {'AwayTeam':<15} {'Ordinal (wins)':<25} same mapping as HomeTeam")
+    print(f"  {'AwayTeam':<15} {'Ordinal (points)':<25} same mapping as HomeTeam")
     print(f"  {'Referee':<15} {'Ordinal (matches)':<25} "
           f"least experienced→0, most→{len(refs_ranked)-1}  ({len(refs_ranked)} referees)")
     print(f"\n  Numerical features ({len(NUMERICAL_FEATURES)}): StandardScaler — applied in SCALING step")
