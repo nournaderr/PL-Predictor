@@ -16,6 +16,7 @@ tools to football clubs and media broadcasters.
 ### Prerequisites
 - Python 3.11
 - [Poetry](https://python-poetry.org/docs/#installation)
+- Make
 
 ### Steps
 ```bash
