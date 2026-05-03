@@ -25,9 +25,6 @@ cd PL-Predictor
 
 # 2. Install dependencies
 poetry install
-
-# 3. Copy environment variables template
-cp .env.example .env
 ```
 
 ## Running the Project
@@ -48,6 +45,3 @@ make test
 # Lint code
 make lint
 ```
-
-## Environment Variables
-Copy `.env.example` to `.env` and fill in any required values:
